@@ -1,0 +1,421 @@
+/**
+ * onEdit trigger para generación de pedido.
+ * Se dispara cuando el checkbox F4 en PRESUPUESTADOR pasa a TRUE.
+ * Inserta filas en PEDIDOS con la lógica original + “Comisión Vecino”,
+ * luego llama a la comprobación de stock/solapamientos.
+ */
+function onEditCreatePedido(e) {
+  if (!e) return;
+  const rng = e.range;
+  const sh  = rng.getSheet();
+  if (
+    sh.getName() === 'PRESUPUESTADOR' &&
+    rng.getA1Notation() === 'F4' &&
+    rng.getValue() === true
+  ) {
+    try {
+      generatePedidoEntries();
+      // Desmarcamos la casilla para no dispararlo de nuevo
+      sh.getRange('F4').setValue(false);
+      SpreadsheetApp.getActive().toast('✅ Pedido agregado correctamente', '¡Éxito!', 5);
+    } catch (err) {
+      SpreadsheetApp.getActive().toast('❌ Error: ' + err.message, '¡Atención!', 10);
+      throw err;
+    }
+  }
+}
+
+
+/**
+ * Inserta el nuevo pedido (encabezado + detalle) en PEDIDOS
+ * y al final combina con la comprobación de stock/solapamientos.
+ */
+function generatePedidoEntries() {
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const presu    = ss.getSheetByName('PRESUPUESTADOR');
+  const base     = ss.getSheetByName('BASE de DATOS');
+  const pedidos  = ss.getSheetByName('PEDIDOS');
+  const settings = ss.getSheetByName('SETTINGS');
+  if (!presu || !base || !pedidos || !settings) {
+    throw new Error('Faltan hojas necesarias (PRESUPUESTADOR, BASE de DATOS, PEDIDOS o SETTINGS).');
+  }
+
+  //
+  // 1) Generar nuevo ID (máximo existente + 1)
+  //
+  const existingIds = pedidos
+    .getRange(2, 1, pedidos.getLastRow() - 1, 1)
+    .getValues()
+    .flat()
+    .filter(String)
+    .map(v => parseInt(v.replace('#', ''), 10) || 0);
+  const nextId = Math.max(0, ...existingIds) + 1;
+  const idPed  = '#' + Utilities.formatString('%07d', nextId);
+
+  //
+  // 2) Datos desde PRESUPUESTADOR y formateo de fechas
+  //
+  const tz      = ss.getSpreadsheetTimeZone();
+  const fmtDate = d => (
+    d instanceof Date
+      ? ((d.getHours() || d.getMinutes())
+          ? Utilities.formatDate(d, tz, 'dd/MM HH:mm')
+          : Utilities.formatDate(d, tz, 'dd/MM'))
+      : ''
+  );
+  const cliente = presu.getRange('J11').getValue();
+  const rawIni  = presu.getRange('J13').getValue();
+  const rawFin  = presu.getRange('J15').getValue();
+  const fIni    = fmtDate(rawIni);
+  const fFin    = fmtDate(rawFin);
+  const total   = presu.getRange('J3').getValue();
+  const entrega = presu.getRange('J19').getValue();
+  const recibe  = presu.getRange('J21').getValue();
+  const logis   = presu.getRange('J23').getValue();
+  const pctDesc = presu.getRange('J7').getValue();
+  const cantJ   = presu.getRange('J17').getValue();
+  const multF24 = settings.getRange('F24').getValue();
+  const multF23 = settings.getRange('F23').getValue();
+
+  //
+  // 3) Leer BASE de DATOS y armar índices byA, byB
+  //
+  const bdValues = base.getDataRange().getValues();
+  const byA = {}, byB = {};
+  bdValues.forEach(row => {
+    const a = row[0].toString();
+    const b = row[1].toString();
+    if (a && !byA[a]) byA[a] = row;
+    if (b && !byB[b]) byB[b] = row;
+  });
+
+  //
+  // 4) Leer bloque PRESU de filas 9 hasta última (col A→Q, 17 columnas)
+  //
+  const lastP     = presu.getLastRow();
+  const presuData = presu.getRange(9, 1, lastP - 8, 17).getValues();
+
+  //
+  // 5) Contar ítems para F en encabezado
+  //
+  let cntItems = 0;
+  presuData.forEach(r => {
+    if (r[1] === true) cntItems++;
+    if (r[12] === true && typeof r[16] === 'number') cntItems += r[16];
+  });
+
+  //
+  // 6) Construir “filas”: header + detalle + comisión
+  //
+  const COLS = 38;
+  const filas = [];
+
+  // 6.1) Encabezado
+  {
+    const h = Array(COLS).fill('');
+    h[0]  = idPed;           // A
+    h[1]  = cliente;         // B
+    h[2]  = fIni;            // C
+    h[3]  = fFin;            // D
+    // E queda vacía
+    h[5]  = cntItems;        // F
+    h[6]  = total;           // G
+    // H,I,J vacíos
+    h[10] = 'No confirmado'; // K
+    h[11] = entrega;         // L
+    h[12] = false;           // M
+    h[13] = recibe;          // N
+    h[14] = false;           // O
+    h[15] = logis;           // P
+    h[16] = false;           // Q
+    // R… en blanco (se calculará luego)
+    h[18] = cantJ;           // S
+    // T…AL vacíos por defecto
+    filas.push(h);
+  }
+
+  // 6.2) Detalle de “paquetes” (check en col B)
+  presuData.forEach(r => {
+    if (r[1] !== true) return; // solo cuando la columna B esté tildada
+    const code  = r[2].toString();
+    const qty   = r[6];
+    const rowBD = byA[code] || byB[code];
+    if (!rowBD) return; // si no existe en BD, saltar
+    const pkgId  = rowBD[0].toString();
+    const pkgRow = byA[pkgId] || rowBD;
+    const rw     = Array(COLS).fill('');
+    rw[0] = idPed;       // A
+    rw[1] = cliente;     // B
+    rw[2] = fIni;        // C
+    rw[3] = fFin;        // D
+    rw[4] = rowBD[3];    // E  (col D de BD)
+    rw[5] = qty;         // F
+    rw[8] = pkgId;       // I
+    rw[9] = rowBD[1];    // J  (código alterno)
+    rw[18] = cntItems;   // S
+    rw[19] = rowBD[4];   // T  (valor unitario de BD)
+    // Copiar W:AL (col 23→38) desde pkgRow[17..32]
+    for (let c = 17; c <= 32; c++) {
+      rw[22 + (c - 17)] = pkgRow[c];
+    }
+    filas.push(rw);
+  });
+
+  // 6.3) Detalle “sueltos” (check en col M)
+  presuData.forEach(r => {
+    if (r[12] !== true) return;
+    const valO = r[14], valQ = r[16], valP = r[15], valN = r[13];
+    const rw   = Array(COLS).fill('');
+    rw[0]  = idPed;    // A
+    rw[1]  = cliente;  // B
+    rw[2]  = fIni;     // C
+    rw[3]  = fFin;     // D
+    rw[4]  = valO;     // E
+    rw[5]  = valQ;     // F
+    rw[18] = cntItems; // S
+    rw[19] = valP;     // T
+    rw[37] = valN;     // AL
+    filas.push(rw);
+  });
+
+  // 6.4) Fila “COMISIÓN VECINO” final
+  {
+    const headerArr       = filas[0];
+    const commissionValue = headerArr[6] * multF23;  // G_encabezado × Settings!F23
+    const comRow          = headerArr.slice();
+    // Limpiar G, K, L, N, P
+    comRow[6]  = '';
+    comRow[10] = '';
+    comRow[11] = '';
+    comRow[13] = '';
+    comRow[15] = '';
+    comRow[4]  = 'COMISIÓN VECINO';      // E
+    comRow[5]  = 1;                      // F = 1 unidad
+    comRow[19] = commissionValue;        // T
+    comRow[37] = 'Comision';             // AL
+    filas.push(comRow);
+  }
+
+  // 7) Poner fórmula MONTH(C2), MONTH(C3), … en col V (índice 21)
+  filas.forEach((_, idx) => {
+    const rowNum = 2 + idx;
+    filas[idx][21] = `=MONTH(C${rowNum})`;
+  });
+
+  //
+  // 8) Calcular dónde insertar: “insPos”
+  //
+  let insPos = pedidos.getLastRow() + 1;
+  if (rawIni instanceof Date) {
+    // Si hay fecha de inicio válida, buscar la primera fila cuyo C > rawIni
+    for (let rr = 2; rr <= pedidos.getLastRow(); rr++) {
+      const a = pedidos.getRange(rr, 1).getValue();
+      if (String(a).startsWith('#')) {
+        const d = pedidos.getRange(rr, 3).getValue();
+        if (d instanceof Date && d > rawIni) {
+          insPos = rr;
+          break;
+        }
+      }
+    }
+  }
+
+  // =======   C L A M P   D E   i n s P o s   S O B R E   g e tLastRow()  =======
+  const lastUsedRow = pedidos.getLastRow();
+  if (insPos < 2) insPos = 2;
+  if (insPos > lastUsedRow + 1) insPos = lastUsedRow + 1;
+
+  // 9) Antes de insertar, NOS ASEGURAMOS de que la hoja tenga suficientes filas físicas:
+  //    - Queremos insertar “filas.length” filas antes de “insPos”. 
+  //    - Después de esa inserción, necesitaremos volcar valores desde “insPos” hasta “insPos + filas.length - 1”.
+  //    - Si la hoja no tiene suficientes filas (getMaxRows), entonces la expandimos ahora:
+
+  const maxRows = pedidos.getMaxRows();
+  const neededTotalRows = insPos + filas.length - 1; 
+  if (maxRows < neededTotalRows) {
+    // Si no alcanza, agregamos “(neededTotalRows - maxRows)” filas al final
+    pedidos.insertRowsAfter(maxRows, neededTotalRows - maxRows);
+  }
+
+  // Opcional: Para debug, ver en el log dónde vamos a insertar
+  // Logger.log(`>>> generatePedidoEntries → insPos final = ${insPos}, filas.length = ${filas.length}, maxRows post-expansión = ${pedidos.getMaxRows()}`);
+
+  //
+  // 10) Insertar filas y volcar valores (ya dentro del rango seguro)
+  //
+  pedidos.insertRowsBefore(insPos, filas.length);
+  pedidos
+    .getRange(insPos, 1, filas.length, COLS)
+    .setValues(filas);
+
+  //
+  // 11) Colocar fórmulas en W:AL (23→38) y valor bruto en AK (37), multiplicando por $F
+  //
+  const sheetId = pedidos.getSheetId();
+  filas.forEach((rowArr, idx) => {
+    const rowNum = insPos + idx;
+    for (let col = 23; col <= 38; col++) {
+      if (col === 37) {
+        // Columna AK → copiar valor bruto sin fórmula
+        pedidos.getRange(rowNum, col).setValue(rowArr[col - 1]);
+      } else {
+        const bv = rowArr[col - 1];
+        if (bv !== '' && !isNaN(bv)) {
+          pedidos.getRange(rowNum, col)
+            .setFormula(
+              `=${bv}` +
+              `*IF(AND(ISNUMBER($T${rowNum}),ISNUMBER($R${rowNum})),$T${rowNum}*(1-$R${rowNum}),"")` +
+              `*$S${rowNum}*${multF24}` +
+              `*$F${rowNum}`
+            );
+        }
+      }
+    }
+    // 11.1) Enlazar R (columna 18) con la R del encabezado
+    if (idx > 0) {
+      pedidos.getRange(rowNum, 18)
+        .setFormula(`=HYPERLINK("#gid=${sheetId}&range=R${insPos}", R${insPos})`);
+    }
+  });
+
+  //
+  // 12) % descuento en R del encabezado (se salta la última fila “COMISIÓN VECINO”)
+  //
+  {
+    const detailCount = filas.length - 2; // restamos header + comisión
+    if (detailCount > 0) {
+      const startD = insPos + 1;
+      const endD   = insPos + detailCount;
+      pedidos.getRange(insPos, 18)
+        .setFormula(
+          `=IFERROR(` +
+            `1 - G${insPos}/(` +
+              `SUMPRODUCT(T${startD}:T${endD},F${startD}:F${endD})*S${insPos}` +
+            `)` +
+          `,"")`
+        );
+    }
+  }
+
+  //
+  // 13) Formato “grueso” en encabezado
+  //
+  pedidos.getRange(insPos, 1, 1, COLS)
+         .setFontWeight('bold')
+         .setBorder(true, true, true, true, false, false, '#000000', SpreadsheetApp.BorderStyle.SOLID_THICK);
+
+  //
+  // 14) Al terminar, ejecuta la verificación de stock/solapamientos
+  //     y abre diálogo modal con los logs.
+  //
+  const logs = checkInventoryAndReturnLogs();
+  SpreadsheetApp.getUi().alert('⚠️ Reservas solapadas', logs.join('\n'), SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+
+/**
+ * Recorre PEDIDOS y BASE de DATOS para:
+ *  • detectar reservas solapadas por paquete
+ *  • sumar qty en cada cluster solapado
+ *  • comparar con stock (solo primera fila de cada paquete en BD)
+ *  • pintar de rojo claro las filas que excedan
+ * Devuelve un array de strings con el log detallado.
+ */
+function checkInventoryAndReturnLogs() {
+  const ss      = SpreadsheetApp.getActive();
+  const pedidos = ss.getSheetByName('PEDIDOS');
+  const base    = ss.getSheetByName('BASE de DATOS');
+  if (!pedidos || !base) {
+    throw new Error('No se encontró PEDIDOS o BASE de DATOS.');
+  }
+
+  // 1) Armar stockMap: solo la PRIMERA fila de cada paquete (col A → índice 0, col G → índice 6)
+  const bd = base.getDataRange().getValues();
+  const stockMap = {};
+  for (let i = 1; i < bd.length; i++) {
+    const pkg = bd[i][0].toString();
+    if (pkg && stockMap[pkg] === undefined) {
+      const v = bd[i][6];
+      stockMap[pkg] = (typeof v === 'number') ? v : parseFloat(v) || 0;
+    }
+  }
+
+  // 2) Limpiar formatos previos en PEDIDOS
+  const lastRow  = pedidos.getLastRow();
+  const lastCol  = pedidos.getLastColumn();
+  if (lastRow > 1) {
+    pedidos.getRange(2, 1, lastRow - 1, lastCol).setBackground(null);
+  }
+
+  // 3) Leer datos de PEDIDOS (desde fila 2 hacia abajo)
+  const data = (lastRow > 1)
+             ? pedidos.getRange(2, 1, lastRow - 1, lastCol).getValues()
+             : [];
+  // Convertir a array de objetos con índices de fila
+  const rows = data.map((r, i) => ({
+    rowIndex: i + 2,          // fila real en hoja (1-based)
+    client:   r[1],           // columna B
+    start:    r[2],           // columna C
+    end:      r[3],           // columna D
+    equip:    r[4],           // columna E
+    qty:      Number(r[5])||0,// columna F
+    pkg:      r[8].toString() // columna I
+  })).filter(r => r.pkg);
+
+  // 4) Agrupar por paquete
+  const byPkg = {};
+  rows.forEach(r => {
+    (byPkg[r.pkg] = byPkg[r.pkg] || []).push(r);
+  });
+
+  const log = ['⚠️ Reservas solapadas detectadas:'];
+
+  // 5) Para cada paquete, encontrar “clusters” de solapamiento (solo por fecha)
+  Object.keys(byPkg).forEach(pkg => {
+    const arr = byPkg[pkg];
+    if (arr.length < 2) return;
+    const n = arr.length;
+    const parent = Array(n).fill(0).map((_, i) => i);
+    function find(x) {
+      return parent[x] === x ? x : (parent[x] = find(parent[x]));
+    }
+    function union(a, b) {
+      const pa = find(a), pb = find(b);
+      if (pa !== pb) parent[pb] = pa;
+    }
+
+    // 5.1) Detectar solapamiento (C-E) a nivel de FECHA (ignoramos hora)
+    for (let i = 0; i < n; i++) {
+      const aS = new Date(arr[i].start).setHours(0, 0, 0, 0);
+      const aE = new Date(arr[i].end  ).setHours(0, 0, 0, 0);
+      for (let j = i + 1; j < n; j++) {
+        const bS = new Date(arr[j].start).setHours(0, 0, 0, 0);
+        const bE = new Date(arr[j].end  ).setHours(0, 0, 0, 0);
+        if (aS <= bE && bS <= aE) {
+          union(i, j);
+        }
+      }
+    }
+
+    // 5.2) Formar clusters y comparar sumatoria de cantidades vs stock
+    const clusters = {};
+    for (let i = 0; i < n; i++) {
+      (clusters[find(i)] = clusters[find(i)] || []).push(arr[i]);
+    }
+    Object.values(clusters).forEach(cluster => {
+      if (cluster.length < 2) return;
+      const totalQty = cluster.reduce((s, r) => s + r.qty, 0);
+      const stock    = stockMap[pkg] || 0;
+      if (totalQty > stock) {
+        log.push(`Paquete ${pkg} (Stock: ${stock}):`);
+        cluster.forEach(r => {
+          const fmt = d => Utilities.formatDate(new Date(d), 'GMT', 'dd/MM');
+          log.push(`  • ${r.client} – "${r.equip}" [${fmt(r.start)}→${fmt(r.end)}] Cant:${r.qty}`);
+          pedidos.getRange(r.rowIndex, 1, 1, lastCol).setBackground('#FFCCCC');
+        });
+      }
+    });
+  });
+
+  return log;
+}
